@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 var (
@@ -12,6 +13,8 @@ var (
 	ErrDeadlock = errors.New("zk: trying to acquire a lock twice")
 	// ErrNotLocked is returned by Unlock when trying to release a lock that has not first be acquired.
 	ErrNotLocked = errors.New("zk: not locked")
+	// ErrWaitLockTimeout is returned by Lock when wait a lock for too long
+	ErrWaitLockTimeout = errors.New("zk: wait lock timeout")
 )
 
 // Lock is a mutual exclusion lock.
@@ -45,14 +48,14 @@ func parseSeq(path string) (int, error) {
 
 // Lock attempts to acquire the lock. It works like LockWithData, but it doesn't
 // write any data to the lock node.
-func (l *Lock) Lock() error {
-	return l.LockWithData([]byte{})
+func (l *Lock) Lock(waitLockTimeout ...time.Duration) error {
+	return l.LockWithData([]byte{}, waitLockTimeout...)
 }
 
 // LockWithData attempts to acquire the lock, writing data into the lock node.
 // It will wait to return until the lock is acquired or an error occurs. If
 // this instance already has the lock then ErrDeadlock is returned.
-func (l *Lock) LockWithData(data []byte) error {
+func (l *Lock) LockWithData(data []byte, waitLockTimeout ...time.Duration) error {
 	if l.lockPath != "" {
 		return ErrDeadlock
 	}
@@ -97,6 +100,7 @@ func (l *Lock) LockWithData(data []byte) error {
 		return err
 	}
 
+	waitLockStartTime := time.Now()
 	for {
 		children, _, err := l.c.Children(l.path)
 		if err != nil {
@@ -134,9 +138,19 @@ func (l *Lock) LockWithData(data []byte) error {
 			continue
 		}
 
-		ev := <-ch
-		if ev.Err != nil {
-			return ev.Err
+		if len(waitLockTimeout) > 0 {
+			if err := waitEventWithTimeout(waitLockStartTime, waitLockTimeout[0], ch); err != nil {
+				/* always delete the path */
+				l.c.DeleteWithRetry(path, -1, 2)
+
+				return err
+			}
+		} else {
+			ev := <-ch
+			if ev.Err != nil {
+				return ev.Err
+			}
+
 		}
 	}
 
@@ -157,4 +171,28 @@ func (l *Lock) Unlock() error {
 	l.lockPath = ""
 	l.seq = 0
 	return nil
+}
+
+func waitEventWithTimeout(startTime time.Time, timeout time.Duration, evChan <-chan Event) error {
+	/* no timeout */
+	if timeout <= 0 {
+		ev := <-evChan
+		return ev.Err
+	}
+
+	/* already timeout */
+	now := time.Now()
+	endTime := startTime.Add(timeout)
+	if !endTime.After(now) {
+		return ErrWaitLockTimeout
+	}
+
+	timer := time.NewTimer(endTime.Sub(now))
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return ErrWaitLockTimeout
+	case ev := <-evChan:
+		return ev.Err
+	}
 }

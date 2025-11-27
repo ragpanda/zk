@@ -1178,6 +1178,20 @@ func (c *Conn) Delete(path string, version int32) error {
 	return err
 }
 
+func (c *Conn) DeleteWithRetry(path string, version int32, retryCount int) error {
+	err := c.Delete(path, version)
+	if err != nil {
+		for i := 0; i < retryCount; i++ {
+			time.Sleep(10 * time.Millisecond)
+			if err = c.Delete(path, version); err == nil {
+				break
+			}
+		}
+	}
+
+	return err
+}
+
 // Exists tells the existence of a znode.
 func (c *Conn) Exists(path string) (bool, *Stat, error) {
 	if err := validatePath(path, false); err != nil {
